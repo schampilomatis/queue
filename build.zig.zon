@@ -1,0 +1,12 @@
+.{
+    .name = .queue,
+    .version = "0.0.0",
+    .fingerprint = 0x7ffd7f63bd95d2ea,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
