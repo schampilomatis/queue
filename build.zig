@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const mod = b.addModule("queue", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/core.zig"),
         .target = target,
     });
     const exe = b.addExecutable(.{

@@ -1,5 +1,5 @@
 const std = @import("std");
-const reader = @import("root.zig");
+const reader = @import("core.zig");
 
 fn hello() void {
     while (true) {
