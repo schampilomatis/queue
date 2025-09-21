@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const net = std.net;
-// https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/
+// https://www.openmymind.net/TCP-Server-In-Zig-Part-3-Minimizing-Writes-and-Reads/
 
 pub fn run_server() !void {
     const address = try net.Address.parseIp("127.0.0.1", 8081);
@@ -25,6 +25,7 @@ pub fn run_server() !void {
 
         const timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
         try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
 
         std.debug.print("{f} connected\n", .{client_address});
 
