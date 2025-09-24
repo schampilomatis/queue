@@ -3,7 +3,7 @@ const posix = std.posix;
 const net = std.net;
 
 const log = std.log.scoped(.tcp);
-// https://www.openmymind.net/TCP-Server-In-Zig-Part-5b-Poll/
+// https://www.openmymind.net/TCP-Server-In-Zig-Part-7-Kqueue/
 
 pub fn run_server() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -15,19 +15,21 @@ pub fn run_server() !void {
 }
 
 const Client = struct {
+    loop: *Epoll,
     reader: Reader,
     socket: posix.socket_t,
     address: std.net.Address,
     to_write: []u8,
     write_buf: []u8,
 
-    fn init(allocator: std.mem.Allocator, socket: posix.socket_t, address: std.net.Address) !Client {
+    fn init(allocator: std.mem.Allocator, socket: posix.socket_t, address: std.net.Address, loop: *Epoll) !Client {
         const reader = try Reader.init(allocator, 4096);
         errdefer reader.deinit(allocator);
 
         const write_buf = try allocator.alloc(u8, 4096);
         errdefer allocator.free(write_buf);
         return .{
+            .loop = loop,
             .reader = reader,
             .socket = socket,
             .address = address,
@@ -48,7 +50,7 @@ const Client = struct {
         };
     }
 
-    fn writeMessage(self: *Client, msg: []const u8) !bool {
+    fn writeMessage(self: *Client, msg: []const u8) !void {
         if (self.to_write.len > 0) {
             return error.PendingMessage;
         }
@@ -64,12 +66,12 @@ const Client = struct {
         return self.write();
     }
 
-    fn write(self: *Client) !bool {
+    fn write(self: *Client) !void {
         var buf = self.to_write;
         defer self.to_write = buf;
         while (buf.len > 0) {
             const n = posix.write(self.socket, buf) catch |err| switch (err) {
-                error.WouldBlock => return false,
+                error.WouldBlock => return self.loop.writeMode(self),
                 else => return err,
             };
             if (n == 0) {
@@ -77,7 +79,7 @@ const Client = struct {
             }
             buf = buf[n..];
         } else {
-            return true;
+            return self.loop.readMode(self);
         }
     }
 };
@@ -155,24 +157,19 @@ const Reader = struct {
 };
 
 const Server = struct {
+    max: usize,
+    loop: Epoll,
     allocator: std.mem.Allocator,
-    client_pool: std.heap.MemoryPool(Client),
     connected: usize,
-    polls: []posix.pollfd,
-    clients: []*Client,
-    client_polls: []posix.pollfd,
+    client_pool: std.heap.MemoryPool(Client),
 
     fn init(allocator: std.mem.Allocator, max: usize) !Server {
-        const polls = try allocator.alloc(posix.pollfd, max + 1);
-        errdefer allocator.free(polls);
-
-        const clients = try allocator.alloc(*Client, max);
-        errdefer allocator.free(clients);
+        const loop = try Epoll.init();
+        errdefer loop.deinit();
 
         return .{
-            .polls = polls,
-            .clients = clients,
-            .client_polls = polls[1..],
+            .max = max,
+            .loop = loop,
             .connected = 0,
             .allocator = allocator,
             .client_pool = std.heap.MemoryPool(Client).init(allocator),
@@ -180,38 +177,32 @@ const Server = struct {
     }
 
     fn deinit(self: *Server) void {
-        self.allocator.free(self.polls);
-        self.allocator.free(self.clients);
+        self.loop.deinit();
+        self.client_pool.deinit();
     }
 
     fn accept(self: *Server, listener: posix.socket_t) !void {
-        const available = self.client_polls.len - self.connected;
+        const available = self.max - self.connected;
         for (0..available) |_| {
-            var client_address: net.Address = undefined;
-            var client_address_len: posix.socklen_t = @sizeOf(net.Address);
+            var address: net.Address = undefined;
+            var address_len: posix.socklen_t = @sizeOf(net.Address);
 
-            const socket = posix.accept(listener, &client_address.any, &client_address_len, 0) catch |err| switch (err) {
+            const socket = posix.accept(listener, &address.any, &address_len, 0) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
             const client = try self.client_pool.create();
             errdefer self.client_pool.destroy(client);
-            client.* = Client.init(self.allocator, socket, client_address) catch |err| {
+            client.* = Client.init(self.allocator, socket, address, &self.loop) catch |err| {
                 posix.close(socket);
                 log.err("failed to initialize client: {}", .{err});
                 return;
             };
-
-            self.clients[self.connected] = client;
-            self.client_polls[self.connected] = .{
-                .fd = socket,
-                .revents = 0,
-                .events = posix.POLL.IN,
-            };
+            try self.loop.newClient(client);
 
             self.connected += 1;
         } else {
-            self.polls[0].events = 0;
+            try self.loop.removeListener(listener);
         }
     }
 
@@ -223,71 +214,99 @@ const Server = struct {
         try posix.bind(listener, &address.any, address.getOsSockLen());
         try posix.listen(listener, 128);
 
-        self.polls[0] = .{
-            .fd = listener,
-            .revents = 0,
-            .events = posix.POLL.IN,
-        };
+        try self.loop.addListener(listener);
 
         while (true) {
-            _ = try posix.poll(self.polls[0 .. self.connected + 1], -1);
-            if (self.polls[0].revents != 0) {
-                self.accept(listener) catch |err| log.err("failed to accept: {}", .{err});
-            }
+            const ready_events = self.loop.wait();
 
-            var i: usize = 0;
-            while (i < self.connected) {
-                const revents = self.client_polls[i].revents;
-                if (revents == 0) {
-                    i += 1;
-                    continue;
-                }
-
-                var client = self.clients[i];
-                if (revents & posix.POLL.IN == posix.POLL.IN) {
-                    std.debug.print("reading from: {f}\n", .{client.address});
-
-                    while (true) {
-                        const msg = client.readMessage() catch {
-                            self.removeClient(i);
-                            break;
-                        } orelse {
-                            i += 1;
-                            break;
-                        };
-                        const written = client.writeMessage(msg) catch {
-                            self.removeClient(i);
-                            break;
-                        };
-                        if (!written) {
-                            self.client_polls[i].events = posix.POLL.OUT;
-                            break;
+            for (ready_events) |ready| {
+                switch (ready.data.ptr) {
+                    0 => self.accept(listener) catch |err| log.err("failed to accept: {}", .{err}),
+                    else => |nptr| {
+                        const events = ready.events;
+                        const client: *Client = @ptrFromInt(nptr);
+                        if (events & std.os.linux.EPOLL.IN == std.os.linux.EPOLL.IN) {
+                            while (true) {
+                                const msg = client.readMessage() catch {
+                                    self.closeClient(client);
+                                    break;
+                                } orelse {
+                                    break;
+                                };
+                                client.writeMessage(msg) catch {
+                                    self.closeClient(client);
+                                    break;
+                                };
+                            }
+                        } else if (events & std.os.linux.EPOLL.OUT == std.os.linux.EPOLL.OUT) {
+                            client.write() catch self.closeClient(client);
                         }
-                    }
-                }
-
-                if (revents & posix.POLL.OUT == posix.POLL.OUT) {
-                    const written = client.write() catch {
-                        self.removeClient(i);
-                        continue;
-                    };
-                    if (written) {
-                        self.client_polls[i].events = posix.POLL.IN;
-                    }
+                    },
                 }
             }
         }
     }
 
-    fn removeClient(self: *Server, at: usize) void {
-        var client = self.clients[at];
-        defer self.client_pool.destroy(client);
+    fn closeClient(self: *Server, client: *Client) void {
         posix.close(client.socket);
         client.deinit(self.allocator);
-
-        self.clients[at] = self.clients[self.connected - 1];
-        self.client_polls[at] = self.client_polls[self.connected - 1];
+        self.client_pool.destroy(client);
         self.connected -= 1;
-        self.polls[0].events = posix.POLL.IN;
+    }
+};
+
+const Epoll = struct {
+    efd: posix.fd_t,
+    ready_list: [128]std.os.linux.epoll_event = undefined,
+
+    fn init() !Epoll {
+        const efd = try posix.epoll_create1(0);
+        return .{ .efd = efd };
+    }
+
+    fn deinit(self: Epoll) void {
+        posix.close(self.efd);
+    }
+
+    fn wait(self: *Epoll) []std.os.linux.epoll_event {
+        const count = posix.epoll_wait(self.efd, &self.ready_list, -1);
+        return self.ready_list[0..count];
+    }
+
+    fn addListener(self: Epoll, listener: posix.socket_t) !void {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN,
+            .data = .{ .ptr = 0 },
+        };
+        try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_ADD, listener, &event);
+    }
+
+    fn removeListener(self: Epoll, listener: posix.socket_t) !void {
+        try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_DEL, listener, null);
+    }
+
+    fn newClient(self: Epoll, client: *Client) !void {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN,
+            .data = .{ .ptr = @intFromPtr(client) },
+        };
+
+        try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_ADD, client.socket, &event);
+    }
+
+    fn readMode(self: Epoll, client: *Client) !void {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN,
+            .data = .{ .ptr = @intFromPtr(client) },
+        };
+        try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_MOD, client.socket, &event);
+    }
+
+    fn writeMode(self: Epoll, client: *Client) !void {
+        var event = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.OUT,
+            .data = .{ .ptr = @intFromPtr(client) },
+        };
+        try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_MOD, client.socket, &event);
     }
 };
