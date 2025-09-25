@@ -289,7 +289,7 @@ const Epoll = struct {
             if (self.index == self.ready_list.len) {
                 return null;
             }
-            self.index += 1;
+            defer self.index += 1;
             const ready = self.ready_list[self.index];
             switch (ready.data.ptr) {
                 0 => return .{ .accept = {} },
