@@ -5,6 +5,12 @@ const net = std.net;
 const log = std.log.scoped(.tcp);
 // https://www.openmymind.net/TCP-Server-In-Zig-Part-7-Kqueue/
 
+const Loop = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .dragonfly, .openbsd => KQueue,
+    .linux => Epoll,
+    else => @panic("platform not supported"),
+};
+
 pub fn run_server() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -15,14 +21,14 @@ pub fn run_server() !void {
 }
 
 const Client = struct {
-    loop: *Epoll,
+    loop: *Loop,
     reader: Reader,
     socket: posix.socket_t,
     address: std.net.Address,
     to_write: []u8,
     write_buf: []u8,
 
-    fn init(allocator: std.mem.Allocator, socket: posix.socket_t, address: std.net.Address, loop: *Epoll) !Client {
+    fn init(allocator: std.mem.Allocator, socket: posix.socket_t, address: std.net.Address, loop: *Loop) !Client {
         const reader = try Reader.init(allocator, 4096);
         errdefer reader.deinit(allocator);
 
@@ -158,13 +164,13 @@ const Reader = struct {
 
 const Server = struct {
     max: usize,
-    loop: Epoll,
+    loop: Loop,
     allocator: std.mem.Allocator,
     connected: usize,
     client_pool: std.heap.MemoryPool(Client),
 
     fn init(allocator: std.mem.Allocator, max: usize) !Server {
-        const loop = try Epoll.init();
+        const loop = try Loop.init();
         errdefer loop.deinit();
 
         return .{
@@ -217,30 +223,26 @@ const Server = struct {
         try self.loop.addListener(listener);
 
         while (true) {
-            const ready_events = self.loop.wait();
-
-            for (ready_events) |ready| {
-                switch (ready.data.ptr) {
-                    0 => self.accept(listener) catch |err| log.err("failed to accept: {}", .{err}),
-                    else => |nptr| {
-                        const events = ready.events;
-                        const client: *Client = @ptrFromInt(nptr);
-                        if (events & std.os.linux.EPOLL.IN == std.os.linux.EPOLL.IN) {
-                            while (true) {
-                                const msg = client.readMessage() catch {
-                                    self.closeClient(client);
-                                    break;
-                                } orelse {
-                                    break;
-                                };
-                                client.writeMessage(msg) catch {
-                                    self.closeClient(client);
-                                    break;
-                                };
-                            }
-                        } else if (events & std.os.linux.EPOLL.OUT == std.os.linux.EPOLL.OUT) {
-                            client.write() catch self.closeClient(client);
+            var it = try self.loop.wait();
+            while (it.next()) |ready| {
+                switch (ready) {
+                    .accept => self.accept(listener) catch |err| log.err("failed to accept: {}", .{err}),
+                    .read => |client| {
+                        while (true) {
+                            const msg = client.readMessage() catch {
+                                self.closeClient(client);
+                                break;
+                            } orelse {
+                                break;
+                            };
+                            client.writeMessage(msg) catch {
+                                self.closeClient(client);
+                                break;
+                            };
                         }
+                    },
+                    .write => |client| {
+                        client.write() catch self.closeClient(client);
                     },
                 }
             }
@@ -253,6 +255,12 @@ const Server = struct {
         self.client_pool.destroy(client);
         self.connected -= 1;
     }
+};
+
+const Event = union(enum) {
+    accept: void,
+    read: *Client,
+    write: *Client,
 };
 
 const Epoll = struct {
@@ -268,10 +276,33 @@ const Epoll = struct {
         posix.close(self.efd);
     }
 
-    fn wait(self: *Epoll) []std.os.linux.epoll_event {
+    fn wait(self: *Epoll) !Iterator {
         const count = posix.epoll_wait(self.efd, &self.ready_list, -1);
-        return self.ready_list[0..count];
+        return .{ .index = 0, .ready_list = self.ready_list[0..count] };
     }
+
+    const Iterator = struct {
+        index: usize,
+        ready_list: []std.os.linux.epoll_event,
+
+        fn next(self: *Iterator) ?Event {
+            if (self.index == self.ready_list.len) {
+                return null;
+            }
+            self.index += 1;
+            const ready = self.ready_list[self.index];
+            switch (ready.data.ptr) {
+                0 => return .{ .accept = {} },
+                else => |nptr| {
+                    const client: *Client = @ptrFromInt(nptr);
+                    if (ready.events & std.os.linux.EPOLL.IN == std.os.linux.EPOLL.IN) {
+                        return .{ .read = client };
+                    }
+                    return .{ .write = client };
+                },
+            }
+        }
+    };
 
     fn addListener(self: Epoll, listener: posix.socket_t) !void {
         var event = std.os.linux.epoll_event{
@@ -308,5 +339,139 @@ const Epoll = struct {
             .data = .{ .ptr = @intFromPtr(client) },
         };
         try posix.epoll_ctl(self.efd, std.os.linux.EPOLL.CTL_MOD, client.socket, &event);
+    }
+};
+
+const KQueue = struct {
+    kfd: posix.fd_t,
+    event_list: [128]std.posix.system.Kevent = undefined,
+    change_list: [16]std.posix.system.Kevent = undefined,
+    change_count: usize = 0,
+
+    fn init() !KQueue {
+        const kfd = try posix.kqueue();
+        return .{ .kfd = kfd };
+    }
+
+    fn deinit(self: KQueue) void {
+        posix.close(self.kfd);
+    }
+
+    fn wait(self: *KQueue) !Iterator {
+        const count = try posix.kevent(self.kfd, self.change_list[0..self.change_count], &self.event_list, null);
+        self.change_count = 0;
+        return .{ .index = 0, .ready_list = self.event_list[0..count] };
+    }
+
+    const Iterator = struct {
+        index: usize,
+        ready_list: []std.posix.system.Kevent,
+
+        fn next(self: *Iterator) ?Event {
+            if (self.index == self.ready_list.len) {
+                return null;
+            }
+            defer self.index += 1;
+            const ready = self.ready_list[self.index];
+            switch (ready.udata) {
+                0 => return .{ .accept = {} },
+                else => |nptr| {
+                    const client: *Client = @ptrFromInt(nptr);
+                    if (ready.filter == std.posix.system.EVFILT.READ) {
+                        return .{ .read = client };
+                    }
+                    return .{ .write = client };
+                },
+            }
+        }
+    };
+
+    fn queueChange(self: *KQueue, event: posix.system.Kevent) !void {
+        var count = self.change_count;
+        if (count == self.change_list.len) {
+            _ = try posix.kevent(self.kfd, &self.change_list, &.{}, null);
+            count = 0;
+        }
+        self.change_list[count] = event;
+        self.change_count = count + 1;
+    }
+
+    fn addListener(self: *KQueue, listener: posix.socket_t) !void {
+        try self.queueChange(.{
+            .ident = @intCast(listener),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        });
+    }
+
+    fn removeListener(self: *KQueue, listener: posix.socket_t) !void {
+        try self.queueChange(.{
+            .ident = @intCast(listener),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.DISABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        });
+    }
+
+    fn newClient(self: *KQueue, client: *Client) !void {
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.WRITE,
+            .flags = posix.system.EV.ADD | posix.system.EV.DISABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
+    }
+
+    fn readMode(self: *KQueue, client: *Client) !void {
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.WRITE,
+            .flags = posix.system.EV.DISABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.ENABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
+    }
+
+    fn writeMode(self: *KQueue, client: *Client) !void {
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.DISABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
+        try self.queueChange(.{
+            .ident = @intCast(client.socket),
+            .filter = posix.system.EVFILT.WRITE,
+            .flags = posix.system.EV.ENABLE,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(client),
+        });
     }
 };
