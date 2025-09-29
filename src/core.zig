@@ -1,10 +1,65 @@
 const std = @import("std");
 
-pub const ReaderWriter = struct {
-    read_index: u64 = 0,
-    read_offset: u64 = 0,
-    write_offset: u64 = 0,
+const MAX_FILE_LEN: u32 = 50 * 1024 * 1024; // 50MB
 
+pub const Inflight = struct {
+    file_index: u32,
+    offset: u32,
+    at: u64,
+};
+
+pub const Metadata = struct {
+    write_file_index: u32,
+    write_offset: u32,
+    read_file_index: u32 = 0,
+    read_offset: u32 = 0,
+    inflight: []Inflight,
+};
+
+pub const Config = struct { base_path: []u8 };
+
+fn file_path(base_path: []u8, index: u32) ![]u8 {
+    var buf: [5]u8 = undefined;
+    return std.fmt.bufPrint(&buf, "{d}", .{index});
+}
+
+pub const Reader = struct {
+    config: *Config,
+    metadata: *Metadata,
+    file: std.fs.File,
+    dir: std.fs.Dir,
+
+    fn init(
+        metadata: *Metadata,
+        config: *Config,
+    ) !Reader {}
+
+    fn next(self: *Reader) ?[]u8 {
+        const res = "abc";
+        const new_offset = self.metadata.read_offset + res.len;
+
+        if (new_offset >= MAX_FILE_LEN) {
+            const new_index = self.metadata.read_file_index + 1;
+            try self.open_file();
+            self.metadata.read_file_index = new_index;
+        } else {
+            self.metadata.read_offset = new_offset;
+        }
+
+        return res;
+    }
+
+    fn open_file(self: *Reader, index: u32) !void {
+        self.file.close();
+        const path = file_path(self.config.base_path, index);
+
+        self.file = try std.fs.openDirAbsolute(self.config.base_path, .{}).createFile(path, .{
+            .read = true,
+        });
+    }
+};
+
+pub const ReaderWriter = struct {
     file: std.fs.File,
 
     fn next_len(self: *ReaderWriter) !u32 {
