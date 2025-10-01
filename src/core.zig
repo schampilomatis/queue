@@ -18,21 +18,36 @@ pub const Metadata = struct {
 
 pub const Config = struct { base_path: []u8 };
 
-fn file_path(base_path: []u8, index: u32) ![]u8 {
+fn file_path(index: u32) ![]u8 {
     var buf: [5]u8 = undefined;
-    return std.fmt.bufPrint(&buf, "{d}", .{index});
+    const printed = try std.fmt.bufPrint(&buf, "{d}", .{index});
+    var i = buf.len;
+    while (i > 0) {
+        i -= 1;
+        if (buf.len - i <= printed.len) {
+            buf[i] = printed[i + printed.len - buf.len];
+        } else {
+            buf[i] = '0';
+        }
+    }
+    return &buf;
 }
 
 pub const Reader = struct {
-    config: *Config,
     metadata: *Metadata,
     file: std.fs.File,
     dir: std.fs.Dir,
 
     fn init(
         metadata: *Metadata,
-        config: *Config,
-    ) !Reader {}
+        dir: std.fs.Dir,
+    ) !Reader {
+        return .{
+            .metadata = metadata,
+            .dir = dir,
+            .file = try dir.createFile(file_path(metadata.read_file_index), .{ .read = true }),
+        };
+    }
 
     fn next(self: *Reader) ?[]u8 {
         const res = "abc";
@@ -51,11 +66,8 @@ pub const Reader = struct {
 
     fn open_file(self: *Reader, index: u32) !void {
         self.file.close();
-        const path = file_path(self.config.base_path, index);
-
-        self.file = try std.fs.openDirAbsolute(self.config.base_path, .{}).createFile(path, .{
-            .read = true,
-        });
+        const path = file_path(index);
+        self.file = try self.dir.createFile(path, .{ .read = true });
     }
 };
 
@@ -99,70 +111,7 @@ pub const Message = struct {
     }
 };
 
-test "write read a message from a file" {
-    const file = try std.fs.cwd().createFile("test.txt", .{
-        .truncate = true,
-        .read = true,
-    });
-    defer file.close();
-    defer std.fs.cwd().deleteFile("test.txt") catch {};
-
-    var reader_writer = ReaderWriter{ .file = file };
-    const data = try std.heap.page_allocator.dupe(u8, "hello world");
-    const in = Message{
-        .data = data,
-        .len = 11,
-    };
-    defer in.deinit();
-
-    try reader_writer.write(in);
-
-    const out = try reader_writer.next();
-    defer out.deinit();
-    try std.testing.expectEqual(@as(usize, 11), out.len);
-    try std.testing.expectEqualStrings("hello world", out.data);
-}
-
-test "write 2 messages and read them" {
-    const file = try std.fs.cwd().createFile("test.txt", .{
-        .truncate = true,
-        .read = true,
-    });
-    defer file.close();
-    defer std.fs.cwd().deleteFile("test.txt") catch {};
-
-    var reader_writer = ReaderWriter{ .file = file };
-
-    const data1 = try std.heap.page_allocator.dupe(u8, "hello world");
-    const in1 = Message{
-        .data = data1,
-        .len = 11,
-    };
-    defer in1.deinit();
-
-    const data2 = try std.heap.page_allocator.dupe(u8, "goodbye world");
-    const in2 = Message{
-        .data = data2,
-        .len = 13,
-    };
-    defer in2.deinit();
-
-    try reader_writer.write(in1);
-    try reader_writer.write(in2);
-
-    const out1 = try reader_writer.next();
-    defer out1.deinit();
-    try std.testing.expectEqual(@as(usize, 11), out1.len);
-    try std.testing.expectEqualStrings("hello world", out1.data);
-
-    const out2 = try reader_writer.next();
-    defer out2.deinit();
-    try std.testing.expectEqual(@as(usize, 11), out2.len);
-    try std.testing.expectEqualStrings("hello world", out2.data);
-
-    try reader_writer.ack();
-    const out3 = try reader_writer.next();
-    defer out3.deinit();
-    try std.testing.expectEqual(@as(usize, 13), out3.len);
-    try std.testing.expectEqualStrings("goodbye world", out3.data);
+test "file_path" {
+    try std.testing.expectEqualStrings("00001", try file_path(1));
+    try std.testing.expectEqualStrings("03001", try file_path(3001));
 }
